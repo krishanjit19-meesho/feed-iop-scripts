@@ -2,42 +2,56 @@
 
 """
 Script to compare two CSV files (feed_catalog_results.csv and query_catalog_results.csv)
-and calculate match percentage for each query.
+and check if catalog ID arrays match exactly for each query.
+
+For each query:
+- If arrays are equal → PASSED
+- If arrays are not equal → FAILED
 """
 
 import csv
 import json
 
-def calculate_match_percentage(l2_ids, feed_ids):
+def compare_arrays(l2_ids, feed_ids):
     """
-    Calculate match percentage between two lists of catalog IDs.
-    Uses Jaccard similarity: intersection / union
+    Compare two arrays of catalog IDs and return status and failure reason.
+    
+    Args:
+        l2_ids: List of catalog IDs from older flow (query_catalog_results.csv)
+        feed_ids: List of catalog IDs from new flow (feed_catalog_results.csv)
+    
+    Returns:
+        Tuple of (status, failure_reason) where:
+        - status is "PASSED" or "FAILED"
+        - failure_reason is empty string if PASSED, or description of failure
     """
-    if not l2_ids and not feed_ids:
-        return 100.0  # Both empty = 100% match
+    # Check if arrays are equal
+    if l2_ids == feed_ids:
+        return ("PASSED", "")
     
-    if not l2_ids or not feed_ids:
-        return 0.0  # One empty, one not = 0% match
+    # Arrays are different - determine the reason
+    l2_len = len(l2_ids)
+    feed_len = len(feed_ids)
     
-    l2_set = set(l2_ids)
-    feed_set = set(feed_ids)
+    if l2_len != feed_len:
+        return ("FAILED", f"Different lengths: older flow has {l2_len} items, new flow has {feed_len} items")
     
-    intersection = len(l2_set & feed_set)
-    union = len(l2_set | feed_set)
+    # Same length but different values - find first difference
+    min_len = min(l2_len, feed_len)
+    for i in range(min_len):
+        if l2_ids[i] != feed_ids[i]:
+            return ("FAILED", f"Different value at position {i}: older flow has {l2_ids[i]}, new flow has {feed_ids[i]}")
     
-    if union == 0:
-        return 100.0
-    
-    match_percentage = (intersection / union) * 100
-    return round(match_percentage, 2)
+    # Should not reach here, but just in case
+    return ("FAILED", "Arrays differ but reason unclear")
 
 def compare_csv_files(l2_csv='query_catalog_results.csv', feed_csv='feed_catalog_results.csv', output_csv='match_percentage_results.csv'):
     """
-    Compare two CSV files and calculate match percentage for each query.
+    Compare two CSV files and check if catalog ID arrays match exactly for each query.
     """
     results = []
     
-    # Read L2 results
+    # Read L2 results (older flow)
     print(f"Reading {l2_csv}...")
     l2_data = {}
     try:
@@ -51,12 +65,12 @@ def compare_csv_files(l2_csv='query_catalog_results.csv', feed_csv='feed_catalog
                     l2_data[query] = catalog_ids
                 except json.JSONDecodeError:
                     l2_data[query] = []
-        print(f"  Found {len(l2_data)} queries in L2 results")
+        print(f"  Found {len(l2_data)} queries in older flow results")
     except FileNotFoundError:
-        print(f"Error: File {l2_csv} not found")
+        print(f"✗ Error: File {l2_csv} not found")
         return None
     
-    # Read Feed results
+    # Read Feed results (new flow)
     print(f"Reading {feed_csv}...")
     feed_data = {}
     try:
@@ -70,9 +84,9 @@ def compare_csv_files(l2_csv='query_catalog_results.csv', feed_csv='feed_catalog
                     feed_data[query] = catalog_ids
                 except json.JSONDecodeError:
                     feed_data[query] = []
-        print(f"  Found {len(feed_data)} queries in Feed results")
+        print(f"  Found {len(feed_data)} queries in new flow results")
     except FileNotFoundError:
-        print(f"Error: File {feed_csv} not found")
+        print(f"✗ Error: File {feed_csv} not found")
         return None
     
     # Get all unique queries
@@ -84,34 +98,35 @@ def compare_csv_files(l2_csv='query_catalog_results.csv', feed_csv='feed_catalog
         l2_ids = l2_data.get(query, [])
         feed_ids = feed_data.get(query, [])
         
-        match_percentage = calculate_match_percentage(l2_ids, feed_ids)
+        status, failure_reason = compare_arrays(l2_ids, feed_ids)
         
         results.append({
             'query': query,
-            'match_percentage': match_percentage
+            'status': status,
+            'failure_reason': failure_reason
         })
     
     # Write results to output CSV
     print(f"\nWriting results to {output_csv}...")
     with open(output_csv, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=['query', 'match_percentage'])
+        writer = csv.DictWriter(f, fieldnames=['query', 'status', 'failure_reason'])
         writer.writeheader()
         writer.writerows(results)
     
     # Calculate summary statistics
     if results:
-        percentages = [r['match_percentage'] for r in results]
-        avg_percentage = sum(percentages) / len(percentages)
-        perfect_matches = sum(1 for p in percentages if p == 100.0)
-        zero_matches = sum(1 for p in percentages if p == 0.0)
+        passed_count = sum(1 for r in results if r['status'] == 'PASSED')
+        failed_count = sum(1 for r in results if r['status'] == 'FAILED')
+        total_count = len(results)
+        passed_percentage = (passed_count / total_count * 100) if total_count > 0 else 0.0
         
         print(f"\n{'='*60}")
         print("SUMMARY")
         print(f"{'='*60}")
-        print(f"Total queries: {len(results)}")
-        print(f"Average match percentage: {avg_percentage:.2f}%")
-        print(f"Perfect matches (100%): {perfect_matches} ({perfect_matches*100/len(results):.1f}%)")
-        print(f"No matches (0%): {zero_matches} ({zero_matches*100/len(results):.1f}%)")
+        print(f"Total queries: {total_count}")
+        print(f"PASSED: {passed_count}")
+        print(f"FAILED: {failed_count}")
+        print(f"Pass percentage: {passed_percentage:.2f}%")
         print(f"{'='*60}")
         print(f"✓ Successfully wrote results to {output_csv}")
     

@@ -14,7 +14,7 @@ from qul_response import get_qul_response
 
 # Configuration - all constants
 FEED_CONTEXT = "text_search_mall_v1"
-LIMIT = 10
+LIMIT = 20
 USER_ID = "376902237"
 USER_CITY = "bengaluru"
 USER_STATE_CODE = "KA"
@@ -24,7 +24,7 @@ ENTITY_ID = 123
 GRPC_HOST = "localhost"
 GRPC_PORT = 8080
 FEED_ID = "farmley"
-INPUT_FILE = 'temp_sorted.csv'
+INPUT_FILE = 'temp.csv'
 OUTPUT_FILE = 'feed_catalog_results.csv'
 # Proto paths - Configure this to point to your feed-iop repository
 #feed-iop repository path
@@ -169,17 +169,12 @@ def extract_catalog_ids(response):
 def fetch_feed_for_query(query):
     """
     Complete pipeline: Get QUL response and then fetch feed via gRPC
+    Returns: (catalog_ids, status) where status is "OK" or "FAILED"
     """
-    # print(f"Processing query: '{query}'")
-    
     # Get QUL response
-    # print("Getting QUL response...")
     qul_response = get_qul_response(query)
     if qul_response is None:
-        # print("Failed to get QUL response")
-        return None
-    
-    # print("QUL response received")
+        return (None, "FAILED")
     
     # Convert QUL response to JSON string (formatted with newlines)
     preprocessor_response = json.dumps(qul_response, indent=4)
@@ -190,33 +185,36 @@ def fetch_feed_for_query(query):
     # Make gRPC call
     try:
         response = call_grpc(request)
-        # print("✓ gRPC call successful")
         
         # Extract catalog IDs
         catalog_ids = extract_catalog_ids(response)
-        return catalog_ids
+        return (catalog_ids, "OK")
     
     except Exception as e:
-        # print(f"✗ Error: {e}")
-        return None
+        return (None, "FAILED")
 
 
-def process_queries_from_csv(input_csv=INPUT_FILE, output_csv=OUTPUT_FILE, limit=5000):
+def process_queries_from_csv(input_csv=INPUT_FILE, output_csv=OUTPUT_FILE, limit=None):
     """
-    Process queries from CSV file and write results to output CSV
+    Process queries from CSV file and write results to output CSV with status column
     """
     results = []
     
     # Read queries from input CSV
-    # print(f"Reading queries from {input_csv}...")
     try:
         with open(input_csv, 'r', encoding='utf-8') as f:
             reader = csv.DictReader(f)
             queries = [row['query'] for row in reader if row.get('query')]
         
-        # Limit to first N queries
-        queries = queries[:limit]
-        print(f"Found {len(queries)} queries to process")
+        # Apply limit if specified
+        total_queries = len(queries)
+        if limit is not None and limit > 0:
+            queries = queries[:limit]
+            print(f"Found {total_queries} queries in {input_csv}, processing first {len(queries)}")
+        else:
+            print(f"Found {len(queries)} queries in {input_csv}, processing all")
+        
+        print(f"Running feed fetch tests...\n")
         
         success_count = 0
         failed_count = 0
@@ -225,41 +223,54 @@ def process_queries_from_csv(input_csv=INPUT_FILE, output_csv=OUTPUT_FILE, limit
         for idx, query in enumerate(queries, 1):
             print(f"[{idx}/{len(queries)}] Processing: '{query}'", end=' ... ', flush=True)
             
-            catalog_ids = fetch_feed_for_query(query)
+            catalog_ids, status = fetch_feed_for_query(query)
             
-            if catalog_ids:
+            if status == "OK" and catalog_ids:
                 # Format catalog_ids as a list string
                 catalog_ids_str = json.dumps(catalog_ids)
                 success_count += 1
-                print(f"✓ Success ({len(catalog_ids)} catalog IDs) | Total: {success_count} success, {failed_count} failed")
+                print(f"✓ OK ({len(catalog_ids)} catalog IDs) | Total: {success_count} OK, {failed_count} FAILED")
                 results.append({
                     'query': query,
-                    'catalog_id': catalog_ids_str
+                    'catalog_id': catalog_ids_str,
+                    'status': 'OK'
                 })
             else:
                 # Write a row for failed queries
                 failed_count += 1
-                print(f"✗ Failed | Total: {success_count} success, {failed_count} failed")
+                print(f"✗ FAILED | Total: {success_count} OK, {failed_count} FAILED")
                 results.append({
                     'query': query,
-                    'catalog_id': '[]'
+                    'catalog_id': '[]',
+                    'status': 'FAILED'
                 })
         
         # Write results to output CSV
-        # print(f"\nWriting {len(results)} results to {output_csv}...")
         with open(output_csv, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=['query', 'catalog_id'])
+            writer = csv.DictWriter(f, fieldnames=['query', 'catalog_id', 'status'])
             writer.writeheader()
             writer.writerows(results)
         
-        print(f"✓ Successfully processed {len(queries)} queries and wrote {len(results)} results to {output_csv}")
+        print(f"\n✓ Successfully processed {len(queries)} queries and wrote {len(results)} results to {output_csv}")
+        
+        # Print summary
+        print("\n" + "="*80)
+        print("SUMMARY")
+        print("="*80)
+        print(f"Total queries tested: {len(queries)}")
+        print(f"OK: {success_count}")
+        print(f"FAILED: {failed_count}")
+        if len(queries) > 0:
+            print(f"Success rate: {(success_count/len(queries)*100):.2f}%")
+        print("="*80)
+        
         return output_csv
         
     except FileNotFoundError:
-        print(f"Error: File {input_csv} not found")
+        print(f"✗ Error: File {input_csv} not found")
         return None
     except Exception as e:
-        print(f"Error processing CSV: {e}")
+        print(f"✗ Error processing CSV: {e}")
         return None
 
 
@@ -305,19 +316,121 @@ def main():
         sys.exit(1)
 
 
-if __name__ == "__main__":
-    # Check if CSV processing mode is requested
-    if len(sys.argv) > 1 and sys.argv[1] == '--process-csv':
-        input_file = sys.argv[2] if len(sys.argv) > 2 else INPUT_FILE
-        output_file = sys.argv[3] if len(sys.argv) > 3 else OUTPUT_FILE
-        limit = 500
+def retry_failed_queries(csv_file_path):
+    """Rerun tests for all queries that have FAILED status in the CSV file.
+    
+    Args:
+        csv_file_path: Path to the CSV file containing previous results
+    """
+    # Read existing results from CSV
+    existing_results = []
+    failed_queries = []
+    
+    try:
+        with open(csv_file_path, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                query = row.get('query', '').strip()
+                status = row.get('status', '').strip()
+                catalog_id = row.get('catalog_id', '').strip()
+                
+                if query:
+                    existing_results.append({
+                        'query': query,
+                        'catalog_id': catalog_id,
+                        'status': status
+                    })
+                    
+                    if status == 'FAILED':
+                        failed_queries.append(query)
+    except FileNotFoundError:
+        print(f"✗ Error: CSV file not found: {csv_file_path}")
+        print("Please run the script first to generate results.")
+        sys.exit(1)
+    except Exception as e:
+        print(f"✗ Error reading CSV file: {e}")
+        sys.exit(1)
+    
+    if not failed_queries:
+        print(f"✓ No failed queries found in {csv_file_path}")
+        print("All queries have passed or the file is empty.")
+        return
+    
+    print(f"Found {len(failed_queries)} failed queries to retry")
+    print(f"Running feed fetch tests for failed queries...\n")
+    
+    # Create a mapping of query to its index in existing_results for quick updates
+    query_to_index = {result['query']: idx for idx, result in enumerate(existing_results)}
+    
+    # Retry failed queries
+    retried = 0
+    passed_after_retry = 0
+    still_failed = 0
+    
+    for idx, query in enumerate(failed_queries, 1):
+        print(f"[{idx}/{len(failed_queries)}] Retrying query: {query}", end=' ... ', flush=True)
         
-        print("="*60)
-        print("CSV Processing Mode")
-        print(f"Processing first {limit} queries from {input_file}")
-        print("="*60)
-        process_queries_from_csv(input_file, output_file, limit)
+        catalog_ids, status = fetch_feed_for_query(query)
+        
+        # Update the existing result
+        result_idx = query_to_index[query]
+        
+        if status == "OK" and catalog_ids:
+            catalog_ids_str = json.dumps(catalog_ids)
+            existing_results[result_idx]['catalog_id'] = catalog_ids_str
+            existing_results[result_idx]['status'] = 'OK'
+            passed_after_retry += 1
+            print(f"✓ OK ({len(catalog_ids)} catalog IDs)")
+        else:
+            existing_results[result_idx]['catalog_id'] = '[]'
+            existing_results[result_idx]['status'] = 'FAILED'
+            still_failed += 1
+            print(f"✗ FAILED")
+        
+        retried += 1
+    
+    # Write updated results back to CSV
+    try:
+        with open(csv_file_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=['query', 'catalog_id', 'status'])
+            writer.writeheader()
+            writer.writerows(existing_results)
+        print(f"\n✓ Updated results written to {csv_file_path}")
+    except Exception as e:
+        print(f"✗ Error writing results CSV: {e}")
+        sys.exit(1)
+    
+    # Print summary
+    print("\n" + "="*80)
+    print("RETRY SUMMARY")
+    print("="*80)
+    print(f"Total failed queries retried: {retried}")
+    print(f"OK after retry: {passed_after_retry}")
+    print(f"Still FAILED: {still_failed}")
+    if retried > 0:
+        print(f"Success rate after retry: {(passed_after_retry/retried*100):.2f}%")
+    print("="*80)
+
+
+if __name__ == "__main__":
+    # Check if retry failed mode is requested
+    if len(sys.argv) > 1 and sys.argv[1] == "--retry-failed":
+        retry_failed_queries(OUTPUT_FILE)
     else:
-        # Default: single query mode
-        main()
+        # Default: batch processing mode from CSV
+        # Parse --limit flag
+        limit = None
+        if "--limit" in sys.argv:
+            limit_idx = sys.argv.index("--limit")
+            if limit_idx + 1 < len(sys.argv):
+                try:
+                    limit = int(sys.argv[limit_idx + 1])
+                except ValueError:
+                    print("✗ Error: --limit must be followed by a number")
+                    sys.exit(1)
+            else:
+                print("✗ Error: --limit requires a number")
+                sys.exit(1)
+        
+        process_queries_from_csv(INPUT_FILE, OUTPUT_FILE, limit)
 
