@@ -740,13 +740,126 @@ def retry_failed_queries(csv_file_path):
     print("="*80)
 
 
+def retry_grpc_failed_queries(csv_file_path):
+    """Rerun tests only for queries that failed due to gRPC call errors.
+    
+    This function filters failed queries by checking if the error message
+    contains "gRPC call failed" or "call failed" (indicating gRPC errors).
+    
+    Args:
+        csv_file_path: Path to the CSV file containing previous results
+    """
+    # Read existing results from CSV
+    existing_results = []
+    grpc_failed_queries = []
+    
+    try:
+        with open(csv_file_path, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                query = row.get('query', '').strip()
+                status = row.get('status', '').strip()
+                error_message = row.get('error_message', '').strip()
+                
+                if query:
+                    existing_results.append({
+                        'query': query,
+                        'status': status,
+                        'error_message': error_message
+                    })
+                    
+                    # Check if this is a gRPC call failure
+                    if status == 'FAILED' and error_message:
+                        error_lower = error_message.lower()
+                        # Check for gRPC call errors
+                        if 'grpc call failed' in error_lower or 'call failed' in error_lower:
+                            grpc_failed_queries.append((query, error_message))
+    except FileNotFoundError:
+        print(f"✗ Error: CSV file not found: {csv_file_path}")
+        print("Please run the script first to generate results.")
+        sys.exit(1)
+    except Exception as e:
+        print(f"✗ Error reading CSV file: {e}")
+        sys.exit(1)
+    
+    if not grpc_failed_queries:
+        print(f"✓ No gRPC call failed queries found in {csv_file_path}")
+        print("All gRPC calls succeeded or no failed queries with gRPC errors.")
+        return
+    
+    print(f"Found {len(grpc_failed_queries)} queries that failed due to gRPC call errors")
+    print(f"Running pagination continuity tests for gRPC-failed queries...\n")
+    
+    # Create a mapping of query to its index in existing_results for quick updates
+    query_to_index = {result['query']: idx for idx, result in enumerate(existing_results)}
+    
+    # Retry gRPC-failed queries
+    retried = 0
+    passed_after_retry = 0
+    still_failed = 0
+    
+    for idx, (query, original_error) in enumerate(grpc_failed_queries, 1):
+        print(f"[{idx}/{len(grpc_failed_queries)}] Retrying query (gRPC error): {query}")
+        print(f"  Original error: {original_error[:80]}...")
+        try:
+            success, error_msg = test_pagination_continuity(query, verbose=False)
+            if success:
+                new_status = "PASSED"
+                new_error_msg = ""
+                passed_after_retry += 1
+            else:
+                new_status = "FAILED"
+                new_error_msg = error_msg or ""
+                still_failed += 1
+        except Exception as e:
+            new_status = "FAILED"
+            new_error_msg = f"Exception: {str(e)}"
+            still_failed += 1
+        
+        # Update the existing result
+        result_idx = query_to_index[query]
+        existing_results[result_idx]['status'] = new_status
+        existing_results[result_idx]['error_message'] = new_error_msg
+        
+        print(f"  Result: {new_status}")
+        if new_error_msg:
+            print(f"  New error: {new_error_msg[:100]}...")
+        print()
+        retried += 1
+    
+    # Write updated results back to CSV
+    try:
+        with open(csv_file_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=['query', 'status', 'error_message'])
+            writer.writeheader()
+            writer.writerows(existing_results)
+        print(f"✓ Updated results written to {csv_file_path}")
+    except Exception as e:
+        print(f"✗ Error writing results CSV: {e}")
+        sys.exit(1)
+    
+    # Print summary
+    print("\n" + "="*80)
+    print("gRPC RETRY SUMMARY")
+    print("="*80)
+    print(f"Total gRPC-failed queries retried: {retried}")
+    print(f"Passed after retry: {passed_after_retry}")
+    print(f"Still failed: {still_failed}")
+    if retried > 0:
+        print(f"Success rate after retry: {(passed_after_retry/retried*100):.2f}%")
+    print("="*80)
+
+
 if __name__ == "__main__":
     # Hardcoded input and output files
     INPUT_FILE = "temp.csv"
     OUTPUT_FILE = "pagination_result.csv"
     
+    # Check if retry gRPC failed mode is requested
+    if len(sys.argv) > 1 and sys.argv[1] == "--retry-grpc-failed":
+        retry_grpc_failed_queries(OUTPUT_FILE)
     # Check if retry failed mode is requested
-    if len(sys.argv) > 1 and sys.argv[1] == "--retry-failed":
+    elif len(sys.argv) > 1 and sys.argv[1] == "--retry-failed":
         retry_failed_queries(OUTPUT_FILE)
     # Check if single test mode is requested
     elif len(sys.argv) > 1 and sys.argv[1] == "--test":
